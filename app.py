@@ -1,9 +1,11 @@
 """Forex signal filter: no brokerage endpoints; cannot place orders."""
-import csv, datetime as dt, json, os, sqlite3, threading
+import csv, datetime as dt, json, os, sqlite3, threading, secrets, html
 from pathlib import Path
 from zoneinfo import ZoneInfo
 import requests
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Depends
+from fastapi.responses import HTMLResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel, Field
 
 ROOT = Path(__file__).parent
@@ -16,6 +18,16 @@ TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
 CALENDAR = Path(os.getenv("CALENDAR_PATH", str(ROOT / "calendar.csv")))
 app = FastAPI(title="Forex AI signal filter (signals only)")
+security = HTTPBasic(auto_error=False)
+DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "")
+
+def require_dashboard(credentials: HTTPBasicCredentials | None = Depends(security)):
+    if not DASHBOARD_PASSWORD or credentials is None or not (
+        secrets.compare_digest(credentials.username.encode(), b"viewer") and
+        secrets.compare_digest(credentials.password.encode(), DASHBOARD_PASSWORD.encode())
+    ):
+        raise HTTPException(status_code=401, detail="Dashboard access denied", headers={"WWW-Authenticate": "Basic realm=ForexDashboard"})
+
 
 with sqlite3.connect(DB) as c:
     c.execute("CREATE TABLE IF NOT EXISTS signals (id TEXT PRIMARY KEY, ts TEXT, symbol TEXT, direction TEXT, entry REAL, sl REAL, tp REAL, rsi REAL, atr REAL, decision TEXT, reason TEXT, outcome_r REAL)")
@@ -86,6 +98,24 @@ def status():
     with sqlite3.connect(DB) as c:
         count=c.execute("SELECT count(*) FROM signals").fetchone()[0]
     return {"mode":"SIGNALS_ONLY_NO_ORDERS","signals_saved":count,"calendar_present":CALENDAR.exists(),"telegram_configured":bool(TG_TOKEN and TG_CHAT),"ml_model_present":(ROOT/"model.pkl").exists(),"warning":"No live calendar ingestion; no signals approved without fresh validated calendar; ephemeral disk without persistent storage"}
+
+
+@app.get("/dashboard", response_class=HTMLResponse, dependencies=[Depends(require_dashboard)])
+def dashboard():
+    with LOCK, sqlite3.connect(DB) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT ts,symbol,direction,entry,sl,tp,decision,reason,outcome_r FROM signals ORDER BY ts DESC LIMIT 100").fetchall()
+        total = conn.execute("SELECT COUNT(*) FROM signals").fetchone()[0]
+    def esc(v):
+        return html.escape(str(v if v is not None else "–"), quote=True)
+    cols = ("ts", "symbol", "direction", "entry", "sl", "tp", "decision", "reason", "outcome_r")
+    entries = "".join("<tr>" + "".join("<td>" + esc(row[k]) + "</td>" for k in cols) + "</tr>" for row in rows)
+    entries = entries or '<tr><td colspan="9">Noch keine Signale empfangen.</td></tr>'
+    calendar_state = 'Datei vorhanden – Aktualität wird bei jedem Signal geprüft' if CALENDAR.exists() else 'NICHT VERBUNDEN: Signale blockiert'
+    model_state = 'Modelldatei vorhanden (nicht als validiert zu verstehen)' if (ROOT/'model.pkl').exists() else 'Kein KI-Modell trainiert'
+    page = """<!doctype html><html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="60"><title>Forex Signal-Dashboard</title><style>body{font-family:system-ui,Arial;background:#101827;color:#e8eef7;margin:0;padding:24px}main{max-width:1180px;margin:auto}.box{background:#1a273a;padding:18px;border-radius:12px;margin:12px 0}h1{margin-bottom:6px}.muted{color:#a8b8ce}.warn{color:#ffce81}.scroll{overflow-x:auto}table{border-collapse:collapse;width:100%;font-size:13px}th,td{padding:10px;text-align:left;border-bottom:1px solid #36465b;white-space:nowrap}th{color:#b5c5db}</style></head><body><main><h1>Forex AI – Signale</h1><p class="muted">Nur Signale · Keine Brokerorders · Aktualisierung alle 60 Sekunden</p><div class="box"><b>Gespeicherte Signale:</b> __TOTAL__<p class="warn">Wirtschaftskalender: __CALENDAR__</p><p>KI: __MODEL__</p><p class="warn">Achtung: Ohne persistenten Speicher gehen Daten bei Neustart/Deployment verloren.</p></div><div class="box"><h2>Letzte 100 Signalprüfungen</h2><div class="scroll"><table><thead><tr><th>Zeit (UTC)</th><th>Paar</th><th>Richtung</th><th>Entry</th><th>SL</th><th>TP</th><th>Entscheidung</th><th>Grund</th><th>Ergebnis (R)</th></tr></thead><tbody>__ENTRIES__</tbody></table></div></div><p class="muted">TradingView-Pfeile sind Rohsignale. Keine geprüfte Profitabilität.</p></main></body></html>"""
+    page = page.replace('__TOTAL__',str(total)).replace('__CALENDAR__',esc(calendar_state)).replace('__MODEL__',esc(model_state)).replace('__ENTRIES__',entries)
+    return HTMLResponse(page, headers={"Cache-Control":"no-store","X-Content-Type-Options":"nosniff","X-Frame-Options":"DENY"})
 
 @app.post("/webhook")
 def webhook(x: Candidate):
