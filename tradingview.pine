@@ -1,0 +1,28 @@
+//@version=6
+indicator("Forex AI Candidate Signals (manual trades)", overlay=true)
+// Sends candidates, NOT orders. The external service decides whether to notify.
+token = input.string("CHANGE_ME", "Webhook token (same as server)")
+fastN = input.int(20, "Fast EMA", minval=1)
+slowN = input.int(50, "Slow EMA", minval=2)
+atrN = input.int(14, "ATR length", minval=1)
+slAtr = input.float(1.5, "Stop distance in ATR", minval=0.5)
+rr = input.float(2.0, "Reward/risk", minval=1)
+fast = ta.ema(close, fastN)
+slow = ta.ema(close, slowN)
+atr = ta.atr(atrN)
+htf = request.security(syminfo.tickerid, "60", ta.ema(close, 50)[1], lookahead=barmerge.lookahead_on)
+htfC = request.security(syminfo.tickerid, "60", close[1], lookahead=barmerge.lookahead_on)
+rsi = ta.rsi(close,14)
+longSignal = barstate.isconfirmed and ta.crossover(fast, slow) and htfC > htf and rsi > 50
+shortSignal = barstate.isconfirmed and ta.crossunder(fast, slow) and htfC < htf and rsi < 50
+plot(fast,"EMA20", color=color.teal)
+plot(slow,"EMA50", color=color.orange)
+plotshape(longSignal,title="BUY candidate",style=shape.triangleup,location=location.belowbar,color=color.lime,size=size.small)
+plotshape(shortSignal,title="SELL candidate",style=shape.triangledown,location=location.abovebar,color=color.red,size=size.small)
+if longSignal or shortSignal
+    dir = longSignal ? "BUY" : "SELL"
+    stop = longSignal ? close - slAtr*atr : close + slAtr*atr
+    take = longSignal ? close + rr*slAtr*atr : close - rr*slAtr*atr
+    uid = syminfo.tickerid + "-" + str.tostring(time) + "-" + dir
+    payload = '{"token":"' + token + '","signal_id":"' + uid + '","symbol":"' + syminfo.ticker + '","direction":"' + dir + '","timeframe":"' + timeframe.period + '","bar_time_ms":' + str.tostring(time) + ',"entry":' + str.tostring(close,format.mintick) + ',"sl":' + str.tostring(stop,format.mintick) + ',"tp":' + str.tostring(take,format.mintick) + ',"rsi":' + str.tostring(rsi) + ',"atr":' + str.tostring(atr,format.mintick) + '}'
+    alert(payload, alert.freq_once_per_bar_close)
