@@ -1,0 +1,175 @@
+//@version=6
+strategy("Forex MTF V6 | Sessions + News-Sperre (manuell)", overlay=true, initial_capital=10000, currency=currency.USD, pyramiding=0, default_qty_type=strategy.percent_of_equity, default_qty_value=1, commission_type=strategy.commission.percent, commission_value=0.0, slippage=2, process_orders_on_close=true, max_labels_count=300)
+// Paper backtest only. Use a 15-minute chart. Historical backtests are not forecasts.
+if timeframe.in_seconds() != 900
+    runtime.error("Bitte den Chart auf 15 Minuten stellen.")
+
+profile = input.string("Ausgewogen", "Signalfrequenz", options=["Konservativ", "Ausgewogen", "Aktiver"])
+fastLen = input.int(20, "EMA schnell", minval=2)
+slowLen = input.int(50, "EMA langsam", minval=5)
+require4h = input.bool(false, "4H-Trend muss zustimmen")
+useSession = input.bool(true, "Nur London/NY")
+marketSession = input.session("0700-1900", "Session Europe/London")
+allowLong = input.bool(true, "Long erlauben")
+allowShort = input.bool(true, "Short erlauben")
+allowPullback = input.bool(true, "Pullbacks")
+allowBreakout = input.bool(true, "Breakouts")
+breakLen = input.int(12, "Breakout-Rueckblick", minval=5)
+pullLookback = input.int(5, "Pullback-Fenster", minval=2, maxval=15)
+cooldownBars = input.int(6, "Abstand zwischen Signalen", minval=0)
+atrMult = input.float(1.3, "SL-Abstand in ATR (Testwert)", minval=0.5, step=0.1)
+rr = input.float(1.3, "Take-Profit R-Multiple (Testwert)", minval=0.8, step=0.1)
+targetMode = input.string("Festes R", "TP-Methode", options=["Festes R", "Naechstes Hoch/Tief"])
+targetLookback = input.int(48, "Zielzone Rueckblick", minval=10)
+minRR = input.float(1.0, "Minimales R fuer Strukturziel", minval=0.5, step=0.1)
+maxBarsInTrade = input.int(32, "Zeit-Ausstieg nach 15m Kerzen (0=aus)", minval=0)
+showLabels = input.bool(true, "Kleine Labels")
+showLevels = input.bool(true, "Trade-Level anzeigen")
+// News windows are manually entered. No live news/calendar feed is connected.
+useNewsBlock = input.bool(false, "Manuelle News-Sperre aktivieren")
+newsBefore = input.int(30, "Minuten VOR News sperren", minval=0, maxval=240)
+newsAfter = input.int(30, "Minuten NACH News sperren", minval=0, maxval=240)
+news1Enabled = input.bool(false, "Termin 1 aktiv")
+news1 = input.time(timestamp("27 Oct 2026 12:00 +0000"), "Termin 1 (Uhrzeit im Eingabefeld)")
+news2Enabled = input.bool(false, "Termin 2 aktiv")
+news2 = input.time(timestamp("28 Oct 2026 12:00 +0000"), "Termin 2 (Uhrzeit im Eingabefeld)")
+news3Enabled = input.bool(false, "Termin 3 aktiv")
+news3 = input.time(timestamp("29 Oct 2026 12:00 +0000"), "Termin 3 (Uhrzeit im Eingabefeld)")
+showDashboard = input.bool(true, "Dashboard anzeigen")
+webhookToken = input.string("", "Cloud Webhook Token (nur für Alerts)")
+cloudAlerts = input.bool(false, "Signalkandidaten an Cloud senden")
+
+emaFast = ta.ema(close, fastLen)
+emaSlow = ta.ema(close, slowLen)
+rsi = ta.rsi(close, 14)
+atr = ta.atr(14)
+[diPlus, diMinus, adx] = ta.dmi(14, 14)
+// Last CLOSED HTF candle used consistently in historical and realtime bars.
+htf45 = request.security(syminfo.tickerid, "45", close[1] > ta.ema(close, 50)[1] ? 1 : -1, lookahead=barmerge.lookahead_on)
+htf60 = request.security(syminfo.tickerid, "60", close[1] > ta.ema(close, 50)[1] ? 1 : -1, lookahead=barmerge.lookahead_on)
+htf240 = request.security(syminfo.tickerid, "240", close[1] > ta.ema(close, 50)[1] ? 1 : -1, lookahead=barmerge.lookahead_on)
+bullVotes = (htf45 == 1 ? 1 : 0) + (htf60 == 1 ? 1 : 0) + (htf240 == 1 ? 1 : 0)
+bearVotes = (htf45 == -1 ? 1 : 0) + (htf60 == -1 ? 1 : 0) + (htf240 == -1 ? 1 : 0)
+neededVotes = profile == "Konservativ" ? 3 : profile == "Ausgewogen" ? 2 : 1
+adxMin = profile == "Konservativ" ? 22.0 : profile == "Ausgewogen" ? 16.0 : 12.0
+rsiBull = profile == "Konservativ" ? 52.0 : profile == "Ausgewogen" ? 50.0 : 48.0
+rsiBear = 100.0 - rsiBull
+htfBull = bullVotes >= neededVotes and (not require4h or htf240 == 1)
+htfBear = bearVotes >= neededVotes and (not require4h or htf240 == -1)
+sessionOK = not useSession or not na(time(timeframe.period, marketSession, "Europe/London"))
+// Block signals if a 15m candle overlaps a user-entered blackout interval.
+msBefore = newsBefore * 60000
+msAfter = newsAfter * 60000
+hitsWindow(eventTime, enabled) =>
+    enabled and time < eventTime + msAfter and time_close > eventTime - msBefore
+newsBlocked = useNewsBlock and (hitsWindow(news1, news1Enabled) or hitsWindow(news2, news2Enabled) or hitsWindow(news3, news3Enabled))
+recentTouchLong = ta.lowest(low, pullLookback) <= emaFast
+recentTouchShort = ta.highest(high, pullLookback) >= emaFast
+longPB = recentTouchLong and close > emaFast and close > open and close > close[1] and (close[1] <= emaFast[1] or low[1] <= emaFast[1])
+shortPB = recentTouchShort and close < emaFast and close < open and close < close[1] and (close[1] >= emaFast[1] or high[1] >= emaFast[1])
+prevHigh = ta.highest(high, breakLen)[1]
+prevLow = ta.lowest(low, breakLen)[1]
+longBO = close > prevHigh and close[1] <= prevHigh[1]
+shortBO = close < prevLow and close[1] >= prevLow[1]
+setupLong = (allowPullback and longPB) or (allowBreakout and longBO)
+setupShort = (allowPullback and shortPB) or (allowBreakout and shortBO)
+localLong = close > emaSlow and emaFast > emaSlow and rsi >= rsiBull and diPlus > diMinus and adx >= adxMin
+localShort = close < emaSlow and emaFast < emaSlow and rsi <= rsiBear and diMinus > diPlus and adx >= adxMin
+
+// Target reference zones from bars finished BEFORE the signal bar.
+oldHigh = ta.highest(high, targetLookback)[1]
+oldLow = ta.lowest(low, targetLookback)[1]
+var int lastBar = na
+var int entryBar = na
+var float entryLevel = na
+var float slLevel = na
+var float tpLevel = na
+cooldown = na(lastBar) or bar_index - lastBar >= cooldownBars
+canEnter = barstate.isconfirmed and sessionOK and not newsBlocked and cooldown and strategy.position_size == 0 and not na(atr) and not na(htf240)
+longSignal = canEnter and allowLong and htfBull and localLong and setupLong
+shortSignal = canEnter and allowShort and htfBear and localShort and setupShort and not longSignal
+
+if longSignal or shortSignal
+    isLong = longSignal
+    candidateEntry = close
+    distance = atr * atrMult
+    candidateSL = isLong ? candidateEntry - distance : candidateEntry + distance
+    fixedTP = isLong ? candidateEntry + distance * rr : candidateEntry - distance * rr
+    structureTP = isLong ? oldHigh : oldLow
+    structureValid = isLong ? (structureTP > candidateEntry + distance * minRR) : (structureTP < candidateEntry - distance * minRR)
+    // Never silently switch to an invalid structure target; use fixed R instead.
+    candidateTP = targetMode == "Naechstes Hoch/Tief" and structureValid ? (isLong ? math.min(fixedTP, structureTP) : math.max(fixedTP, structureTP)) : fixedTP
+    entryLevel := candidateEntry
+    slLevel := candidateSL
+    tpLevel := candidateTP
+    lastBar := bar_index
+    entryBar := bar_index
+    if isLong
+        strategy.entry("LONG", strategy.long)
+        strategy.exit("LONG TP/SL", "LONG", stop=slLevel, limit=tpLevel, comment_profit="TP", comment_loss="SL")
+    else
+        strategy.entry("SHORT", strategy.short)
+        strategy.exit("SHORT TP/SL", "SHORT", stop=slLevel, limit=tpLevel, comment_profit="TP", comment_loss="SL")
+    if cloudAlerts and webhookToken != ""
+        signalDirection = isLong ? "BUY" : "SELL"
+        signalId = syminfo.tickerid + "-" + str.tostring(time_close) + "-" + signalDirection
+        payload = '{"token":"' + webhookToken + '","signal_id":"' + signalId + '","symbol":"' + syminfo.ticker + '","direction":"' + signalDirection + '","timeframe":"15","bar_time_ms":' + str.tostring(time_close) + ',"entry":' + str.tostring(candidateEntry) + ',"sl":' + str.tostring(candidateSL) + ',"tp":' + str.tostring(candidateTP) + ',"rsi":' + str.tostring(rsi) + ',"atr":' + str.tostring(atr) + '}'
+        alert(payload, alert.freq_once_per_bar_close)
+    if showLabels
+        info = (isLong ? "BUY" : "SELL") + " | Entry " + str.tostring(entryLevel, format.mintick) + " | SL " + str.tostring(slLevel, format.mintick) + " | TP " + str.tostring(tpLevel, format.mintick)
+        label.new(bar_index, isLong ? low : high, isLong ? "B" : "S", style=isLong ? label.style_label_up : label.style_label_down, yloc=isLong ? yloc.belowbar : yloc.abovebar, size=size.tiny, color=isLong ? color.green : color.red, textcolor=color.white, tooltip=info)
+
+if maxBarsInTrade > 0 and strategy.position_size != 0 and not na(entryBar) and bar_index - entryBar >= maxBarsInTrade
+    strategy.close_all(comment="ZEIT")
+
+plot(emaFast, "EMA schnell", color=color.teal)
+plot(emaSlow, "EMA langsam", color=color.orange)
+active = strategy.position_size != 0
+plot(showLevels and active ? entryLevel : na, "Entry", color=color.blue, style=plot.style_linebr)
+plot(showLevels and active ? slLevel : na, "SL", color=color.red, style=plot.style_linebr)
+plot(showLevels and active ? tpLevel : na, "TP", color=color.green, style=plot.style_linebr)
+
+var int tpCount = 0
+var int slCount = 0
+var int timeCount = 0
+var int otherCount = 0
+var int lastClosed = 0
+if strategy.closedtrades > lastClosed
+    for i = lastClosed to strategy.closedtrades - 1
+        reason = strategy.closedtrades.exit_comment(i)
+        if reason == "TP"
+            tpCount += 1
+        else if reason == "SL"
+            slCount += 1
+        else if reason == "ZEIT"
+            timeCount += 1
+        else
+            otherCount += 1
+    lastClosed := strategy.closedtrades
+var table dash = table.new(position.top_right, 2, 12, bgcolor=color.new(color.black, 25))
+if barstate.islast and showDashboard
+    table.cell(dash, 0, 0, "V6 | MTF", text_color=color.white)
+    table.cell(dash, 1, 0, targetMode, text_color=color.white)
+    table.cell(dash, 0, 1, "45m / 1H / 4H", text_color=color.white)
+    table.cell(dash, 1, 1, str.tostring(htf45) + "/" + str.tostring(htf60) + "/" + str.tostring(htf240), text_color=color.white)
+    table.cell(dash, 0, 2, "Take Profits", text_color=color.white)
+    table.cell(dash, 1, 2, str.tostring(tpCount), text_color=color.lime)
+    table.cell(dash, 0, 3, "Stop Loss", text_color=color.white)
+    table.cell(dash, 1, 3, str.tostring(slCount), text_color=color.red)
+    table.cell(dash, 0, 4, "Zeit-Ausstieg", text_color=color.white)
+    table.cell(dash, 1, 4, str.tostring(timeCount), text_color=color.yellow)
+    table.cell(dash, 0, 5, "Andere", text_color=color.white)
+    table.cell(dash, 1, 5, str.tostring(otherCount), text_color=color.white)
+    table.cell(dash, 0, 6, "Trades", text_color=color.white)
+    table.cell(dash, 1, 6, str.tostring(strategy.closedtrades), text_color=color.white)
+
+    table.cell(dash, 0, 7, "Long / Short", text_color=color.white)
+    table.cell(dash, 1, 7, (allowLong ? "AN" : "AUS") + " / " + (allowShort ? "AN" : "AUS"), text_color=color.white)
+    table.cell(dash, 0, 8, "Session", text_color=color.white)
+    table.cell(dash, 1, 8, sessionOK ? "FREI" : "GESPERRT", text_color=sessionOK ? color.lime : color.orange)
+    table.cell(dash, 0, 9, "Manuelle News", text_color=color.white)
+    table.cell(dash, 1, 9, not useNewsBlock ? "AUS" : newsBlocked ? "GESPERRT" : "FREI*", text_color=newsBlocked ? color.orange : color.white)
+    table.cell(dash, 0, 10, "Einstieg", text_color=color.white)
+    table.cell(dash, 1, 10, active ? str.tostring(entryLevel, format.mintick) : "KEIN TRADE", text_color=color.white)
+    table.cell(dash, 0, 11, "Live-Newsfeed", text_color=color.white)
+    table.cell(dash, 1, 11, "NICHT VERBUNDEN", text_color=color.orange)

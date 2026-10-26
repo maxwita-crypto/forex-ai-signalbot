@@ -7,13 +7,14 @@ from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
 ROOT = Path(__file__).parent
-DB = ROOT / "signals.sqlite3"
+DB = Path(os.getenv("DATABASE_PATH", str(ROOT / "signals.sqlite3")))
+DB.parent.mkdir(parents=True, exist_ok=True)
 LOCK = threading.Lock()
 TOKEN = os.getenv("WEBHOOK_TOKEN", "")
 ADMIN = os.getenv("ADMIN_TOKEN", "")
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
-CALENDAR = ROOT / "calendar.csv"
+CALENDAR = Path(os.getenv("CALENDAR_PATH", str(ROOT / "calendar.csv")))
 app = FastAPI(title="Forex AI signal filter (signals only)")
 
 with sqlite3.connect(DB) as c:
@@ -61,7 +62,7 @@ def ml_guard(c, candidate):
     if candidate.rsi < 30 or candidate.rsi > 70: return False, "RSI extreme"
     if abs(candidate.entry-candidate.sl) < 1e-7: return False,"Invalid stop distance"
     rr = abs(candidate.tp-candidate.entry) / abs(candidate.entry-candidate.sl)
-    if rr < 1.9: return False,"Risk/reward below 1.9"
+    if rr < 1.0: return False,"Risk/reward below 1.0"
     model_path=ROOT / "model.pkl"
     if model_path.exists():
         # Joblib/pickle is unsafe for untrusted files. Only load locally generated model.
@@ -84,7 +85,7 @@ def notify(message):
 def status():
     with sqlite3.connect(DB) as c:
         count=c.execute("SELECT count(*) FROM signals").fetchone()[0]
-    return {"mode":"SIGNALS_ONLY_NO_ORDERS","signals_saved":count,"calendar_present":CALENDAR.exists(),"telegram_configured":bool(TG_TOKEN and TG_CHAT),"ml_model_present":(ROOT/"model.pkl").exists()}
+    return {"mode":"SIGNALS_ONLY_NO_ORDERS","signals_saved":count,"calendar_present":CALENDAR.exists(),"telegram_configured":bool(TG_TOKEN and TG_CHAT),"ml_model_present":(ROOT/"model.pkl").exists(),"warning":"No live calendar ingestion; no signals approved without fresh validated calendar; ephemeral disk without persistent storage"}
 
 @app.post("/webhook")
 def webhook(x: Candidate):
